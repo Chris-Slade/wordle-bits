@@ -76,6 +76,13 @@ impl Histogram {
         }
     }
 
+    fn distinct_patterns(&self) -> usize {
+        match self {
+            Self::Flat { touched, .. } => touched.len(),
+            Self::Sparse(map) => map.len(),
+        }
+    }
+
     fn entropy_bits(&self, total: usize) -> f64 {
         let n = total as f64;
         let term = |count: u32| {
@@ -107,35 +114,72 @@ pub fn entropy_bits(guess: &[u8], candidates: &[&[u8]], hist: &mut Histogram) ->
 pub struct Suggestion {
     pub word: String,
     pub bits: f64,
+    /// Probability of winning within this guess and one follow-up candidate
+    /// guess: each feedback pattern's bucket is won next turn with probability
+    /// 1/|bucket|, so the total is (distinct patterns) / (candidate count).
+    /// A guess that is itself a candidate wins its own bucket immediately.
+    pub win_prob: f64,
     pub is_candidate: bool,
 }
 
-/// Score every word in `pool` and return the `top_n` best suggestions.
-/// Ties break toward words that are still possible answers, then alphabetically.
-pub fn rank_guesses(
-    pool: &[&[u8]],
-    candidates: &[&[u8]],
-    top_n: usize,
-    word_len: usize,
-) -> Vec<Suggestion> {
+/// Score every word in `pool` against the remaining candidates. The result is
+/// unordered; use the `top_by_*` selectors to rank it.
+pub fn score_guesses(pool: &[&[u8]], candidates: &[&[u8]], word_len: usize) -> Vec<Suggestion> {
     let candidate_set: HashSet<&[u8]> = candidates.iter().copied().collect();
     let mut hist = Histogram::new(word_len);
-    let mut scored: Vec<Suggestion> = pool
-        .iter()
-        .map(|&word| Suggestion {
-            word: String::from_utf8_lossy(word).into_owned(),
-            bits: entropy_bits(word, candidates, &mut hist),
-            is_candidate: candidate_set.contains(word),
+    let n = candidates.len() as f64;
+    pool.iter()
+        .map(|&word| {
+            let bits = entropy_bits(word, candidates, &mut hist);
+            Suggestion {
+                word: String::from_utf8_lossy(word).into_owned(),
+                bits,
+                win_prob: hist.distinct_patterns() as f64 / n,
+                is_candidate: candidate_set.contains(word),
+            }
         })
-        .collect();
-    scored.sort_by(|a, b| {
+        .collect()
+}
+
+/// Top `top_n` by expected information; ties break toward higher win
+/// probability, then possible answers, then alphabetically.
+pub fn top_by_information<'a>(
+    scored: impl IntoIterator<Item = &'a Suggestion>,
+    top_n: usize,
+) -> Vec<&'a Suggestion> {
+    top_by(scored, top_n, |a, b| {
         b.bits
             .total_cmp(&a.bits)
+            .then(b.win_prob.total_cmp(&a.win_prob))
             .then(b.is_candidate.cmp(&a.is_candidate))
             .then(a.word.cmp(&b.word))
-    });
-    scored.truncate(top_n);
-    scored
+    })
+}
+
+/// Top `top_n` by win probability; ties break toward higher information,
+/// then possible answers, then alphabetically.
+pub fn top_by_win_probability<'a>(
+    scored: impl IntoIterator<Item = &'a Suggestion>,
+    top_n: usize,
+) -> Vec<&'a Suggestion> {
+    top_by(scored, top_n, |a, b| {
+        b.win_prob
+            .total_cmp(&a.win_prob)
+            .then(b.bits.total_cmp(&a.bits))
+            .then(b.is_candidate.cmp(&a.is_candidate))
+            .then(a.word.cmp(&b.word))
+    })
+}
+
+fn top_by<'a>(
+    scored: impl IntoIterator<Item = &'a Suggestion>,
+    top_n: usize,
+    cmp: impl Fn(&Suggestion, &Suggestion) -> std::cmp::Ordering,
+) -> Vec<&'a Suggestion> {
+    let mut refs: Vec<&Suggestion> = scored.into_iter().collect();
+    refs.sort_by(|a, b| cmp(a, b));
+    refs.truncate(top_n);
+    refs
 }
 
 #[cfg(test)]
@@ -235,11 +279,11 @@ mod tests {
         let list = words(&["ammmm", "annnn", "bmmmm", "bnnnn"]);
         let all: Vec<&[u8]> = list.iter().map(Vec::as_slice).collect();
         let candidates = vec![all[0], all[1]]; // ammmm, annnn
-        let ranked = rank_guesses(&all, &candidates, 2, 5);
+        let scored = score_guesses(&all, &candidates, 5);
+        let ranked = top_by_information(&scored, 2);
         assert_eq!(ranked.len(), 2);
-        // Words with 'm'/'n' distinguish the two candidates (1 bit); all do here
-        // except none — every word contains m or n, so all score 1 bit and the
-        // candidate tiebreak puts the two candidates first.
+        // Every word in the list distinguishes the two candidates (1 bit each),
+        // so the candidate tiebreak puts the two candidates first.
         assert!(ranked[0].is_candidate && ranked[1].is_candidate);
         assert_eq!(ranked[0].word, "ammmm");
     }
@@ -249,8 +293,47 @@ mod tests {
         let list = words(&["ammmm", "annnn", "bmmmm", "bnnnn"]);
         let all: Vec<&[u8]> = list.iter().map(Vec::as_slice).collect();
         let candidates = vec![all[0], all[1]];
-        let ranked = rank_guesses(&candidates, &candidates, 10, 5);
+        let scored = score_guesses(&candidates, &candidates, 5);
+        let ranked = top_by_information(&scored, 10);
         assert_eq!(ranked.len(), 2);
         assert!(ranked.iter().all(|s| s.is_candidate));
+    }
+
+    #[test]
+    fn win_probability_counts_distinct_patterns() {
+        // The stout/stopt/stott endgame: each candidate lumps the other two
+        // into one bucket (2 patterns -> 2/3), while a word probing the
+        // differing letters separates all three (3 patterns -> 1.0).
+        let list = words(&["stopt", "stott", "stout"]);
+        let candidates: Vec<&[u8]> = list.iter().map(Vec::as_slice).collect();
+        let scored = score_guesses(&candidates, &candidates, 5);
+        for s in &scored {
+            assert!(
+                (s.win_prob - 2.0 / 3.0).abs() < 1e-12,
+                "{}: {}",
+                s.word,
+                s.win_prob
+            );
+        }
+        let probe = score_guesses(&[b"upped"], &candidates, 5);
+        assert!(
+            (probe[0].win_prob - 1.0).abs() < 1e-12,
+            "{}",
+            probe[0].win_prob
+        );
+        assert!(!probe[0].is_candidate);
+    }
+
+    #[test]
+    fn win_probability_ranking_prefers_full_separation() {
+        let list = words(&["stopt", "stott", "stout", "upped"]);
+        let all: Vec<&[u8]> = list.iter().map(Vec::as_slice).collect();
+        let candidates = vec![all[0], all[1], all[2]];
+        let scored = score_guesses(&all, &candidates, 5);
+        let by_win = top_by_win_probability(&scored, 4);
+        assert_eq!(by_win[0].word, "upped");
+        // The information ranking also puts the full separator first here.
+        let by_bits = top_by_information(&scored, 4);
+        assert_eq!(by_bits[0].word, "upped");
     }
 }

@@ -13,8 +13,8 @@ use solver::Guess;
 #[derive(Parser)]
 #[command(version, about)]
 struct Cli {
-    /// Past guesses as "WORD PATTERN", e.g. "crane XGXYX"
-    /// (G=green, Y=yellow, X=gray; case-insensitive)
+    /// Past guesses as WORD PATTERN pairs, quoted or not:
+    /// `crane XGXYX` or `"crane XGXYX"` (G=green, Y=yellow, X=gray; case-insensitive)
     guesses: Vec<String>,
 
     /// Path to a wordlist file, one word per line (default: bundled Wordle guess list)
@@ -30,11 +30,27 @@ struct Cli {
     candidates_only: bool,
 }
 
-fn parse_guess(arg: &str, word_len: usize) -> Result<Guess> {
-    let mut parts = arg.split_whitespace();
-    let (Some(word), Some(pattern), None) = (parts.next(), parts.next(), parts.next()) else {
-        bail!("expected \"WORD PATTERN\", e.g. \"crane XGXYX\"");
-    };
+/// Pair up guess tokens from the command line. Each positional argument may be
+/// a bare WORD or PATTERN token, or a quoted "WORD PATTERN" pair.
+fn parse_guesses(args: &[String], word_len: usize) -> Result<Vec<Guess>> {
+    let tokens: Vec<&str> = args.iter().flat_map(|a| a.split_whitespace()).collect();
+    ensure!(
+        tokens.len().is_multiple_of(2),
+        "expected WORD PATTERN pairs, but got an odd number of tokens ({})",
+        tokens.len()
+    );
+    tokens
+        .chunks(2)
+        .enumerate()
+        .map(|(i, pair)| {
+            parse_guess(pair[0], pair[1], word_len).with_context(|| {
+                format!("guess {} (\"{} {}\") is invalid", i + 1, pair[0], pair[1])
+            })
+        })
+        .collect()
+}
+
+fn parse_guess(word: &str, pattern: &str, word_len: usize) -> Result<Guess> {
     ensure!(
         word.chars().all(|c| c.is_ascii_alphabetic()),
         "word \"{word}\" contains non-alphabetic characters"
@@ -54,12 +70,7 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
     let (words, word_len) = wordlist::load(cli.wordlist.as_deref())?;
 
-    let mut guesses = Vec::new();
-    for (i, arg) in cli.guesses.iter().enumerate() {
-        let guess = parse_guess(arg, word_len)
-            .with_context(|| format!("guess {} (\"{arg}\") is invalid", i + 1))?;
-        guesses.push(guess);
-    }
+    let guesses = parse_guesses(&cli.guesses, word_len)?;
 
     if let Some(solved) = guesses
         .iter()
@@ -75,7 +86,7 @@ fn main() -> Result<()> {
             .is_err()
         {
             eprintln!(
-                "warning: guessed word \"{}\" is not in the wordlist",
+                "Warning: guessed word \"{}\" is not in the wordlist",
                 String::from_utf8_lossy(&g.word)
             );
         }
@@ -84,7 +95,7 @@ fn main() -> Result<()> {
     let candidates = solver::filter_candidates(&words, &guesses);
     match candidates.len() {
         0 => bail!(
-            "no candidates match these guesses — check the patterns for typos or a wordlist mismatch"
+            "No candidates match these guesses. Check the patterns for typos or a wordlist mismatch."
         ),
         1 => {
             println!(
@@ -110,31 +121,50 @@ fn main() -> Result<()> {
         &full_pool
     };
 
-    let suggestions = solver::rank_guesses(pool, &candidates, cli.top, word_len);
+    let scored = solver::score_guesses(pool, &candidates, word_len);
 
-    println!();
-    println!("Top guesses by expected information:");
-    let width = suggestions.iter().map(|s| s.word.len()).max().unwrap_or(0);
-    let mut any_candidate = false;
-    for (i, s) in suggestions.iter().enumerate() {
-        let marker = if s.is_candidate {
-            any_candidate = true;
-            "   *"
-        } else {
-            ""
-        };
-        println!(
-            "{:>4}. {:<width$}   {:>5.2} bits{marker}",
-            i + 1,
-            s.word,
-            s.bits
+    if cli.candidates_only {
+        print_section(
+            "Top candidates by expected information",
+            &solver::top_by_information(&scored, cli.top),
         );
-    }
-    if any_candidate && !cli.candidates_only {
+        print_section(
+            "Top candidates by win probability (this guess or the next)",
+            &solver::top_by_win_probability(&scored, cli.top),
+        );
+    } else {
+        print_section(
+            "Top guesses by expected information",
+            &solver::top_by_information(&scored, cli.top),
+        );
+        print_section(
+            "Top candidates by expected information",
+            &solver::top_by_information(scored.iter().filter(|s| s.is_candidate), cli.top),
+        );
+        print_section(
+            "Top guesses by win probability (this guess or the next)",
+            &solver::top_by_win_probability(&scored, cli.top),
+        );
         println!();
         println!("* = still a possible answer");
     }
     Ok(())
+}
+
+fn print_section(title: &str, suggestions: &[&solver::Suggestion]) {
+    println!();
+    println!("{title}:");
+    let width = suggestions.iter().map(|s| s.word.len()).max().unwrap_or(0);
+    for (i, s) in suggestions.iter().enumerate() {
+        let marker = if s.is_candidate { "   *" } else { "" };
+        println!(
+            "{:>4}. {:<width$}   {:>5.2} bits   {:>5.1}% win{marker}",
+            i + 1,
+            s.word,
+            s.bits,
+            100.0 * s.win_prob
+        );
+    }
 }
 
 #[cfg(test)]
@@ -142,34 +172,68 @@ mod tests {
     use super::*;
     use feedback::{GRAY, GREEN, YELLOW};
 
+    fn args(list: &[&str]) -> Vec<String> {
+        list.iter().map(ToString::to_string).collect()
+    }
+
     #[test]
     fn parse_guess_happy_path() {
-        let g = parse_guess("GREEN GXYYX", 5).unwrap();
+        let g = parse_guess("GREEN", "GXYYX", 5).unwrap();
         assert_eq!(g.word, b"green");
         assert_eq!(g.pattern, [GREEN, GRAY, YELLOW, YELLOW, GRAY]);
     }
 
     #[test]
-    fn parse_guess_requires_two_tokens() {
-        assert!(parse_guess("green", 5).is_err());
-        assert!(parse_guess("green GXYYX extra", 5).is_err());
+    fn parse_guesses_accepts_quoted_pairs() {
+        let guesses = parse_guesses(&args(&["TARES XXGYY", "MELEE XXGGX"]), 5).unwrap();
+        assert_eq!(guesses.len(), 2);
+        assert_eq!(guesses[0].word, b"tares");
+        assert_eq!(guesses[1].word, b"melee");
     }
 
     #[test]
-    fn parse_guess_rejects_wrong_word_length() {
-        let err = parse_guess("greens GXYYXG", 5).unwrap_err().to_string();
+    fn parse_guesses_accepts_unquoted_tokens() {
+        let guesses = parse_guesses(&args(&["TARES", "XXGYY", "MELEE", "XXGGX"]), 5).unwrap();
+        assert_eq!(guesses.len(), 2);
+        assert_eq!(guesses[0].word, b"tares");
+        assert_eq!(guesses[1].word, b"melee");
+    }
+
+    #[test]
+    fn parse_guesses_accepts_mixed_quoting() {
+        let guesses = parse_guesses(&args(&["TARES XXGYY", "MELEE", "XXGGX"]), 5).unwrap();
+        assert_eq!(guesses.len(), 2);
+        assert_eq!(guesses[1].word, b"melee");
+        assert_eq!(guesses[1].pattern, [GRAY, GRAY, GREEN, GREEN, GRAY]);
+    }
+
+    #[test]
+    fn parse_guesses_rejects_odd_token_count() {
+        let err = parse_guesses(&args(&["tares XXGYY melee"]), 5)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("odd number of tokens (3)"), "{err}");
+    }
+
+    #[test]
+    fn parse_guesses_rejects_wrong_word_length() {
+        let err = parse_guesses(&args(&["greens GXYYXG"]), 5)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("guess 1"), "{err}");
+        let err = parse_guess("greens", "GXYYXG", 5).unwrap_err().to_string();
         assert!(err.contains("has length 6, expected 5"), "{err}");
     }
 
     #[test]
     fn parse_guess_rejects_wrong_pattern_length() {
-        let err = parse_guess("green GXYY", 5).unwrap_err().to_string();
+        let err = parse_guess("green", "GXYY", 5).unwrap_err().to_string();
         assert!(err.contains("has length 4, expected 5"), "{err}");
     }
 
     #[test]
     fn parse_guess_rejects_non_alphabetic_word() {
-        let err = parse_guess("gr33n GXYYX", 5).unwrap_err().to_string();
+        let err = parse_guess("gr33n", "GXYYX", 5).unwrap_err().to_string();
         assert!(err.contains("non-alphabetic"), "{err}");
     }
 }
