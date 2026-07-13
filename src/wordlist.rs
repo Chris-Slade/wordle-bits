@@ -4,7 +4,9 @@ use anyhow::{Context, Result, bail, ensure};
 
 use crate::feedback::MAX_WORD_LEN;
 
-/// The standard Wordle valid-guess list, bundled so the binary works out of the box.
+/// The standard Wordle valid-guess list, bundled so the binary works out of
+/// the box. Excluded when building with `--no-default-features`.
+#[cfg(feature = "bundled-wordlist")]
 pub const DEFAULT_WORDLIST: &str = include_str!("../words/valid-guesses.txt");
 
 /// Load a wordlist from `path`, or the bundled default when `path` is `None`.
@@ -19,7 +21,12 @@ pub fn load(path: Option<&Path>) -> Result<(Vec<Vec<u8>>, usize)> {
                 .with_context(|| format!("failed to read wordlist {}", p.display()))?;
             parse(&contents)
         }
+        #[cfg(feature = "bundled-wordlist")]
         None => parse(DEFAULT_WORDLIST),
+        #[cfg(not(feature = "bundled-wordlist"))]
+        None => anyhow::bail!(
+            "this build has no bundled wordlist (the `bundled-wordlist` feature was disabled); pass --wordlist <PATH>"
+        ),
     }
 }
 
@@ -96,10 +103,18 @@ mod tests {
         assert!(err.contains("empty"), "{err}");
     }
 
+    #[cfg(feature = "bundled-wordlist")]
     #[test]
     fn default_wordlist_loads() {
         let (words, len) = load(None).unwrap();
         assert_eq!(len, 5);
         assert!(words.len() > 10_000);
+    }
+
+    #[cfg(not(feature = "bundled-wordlist"))]
+    #[test]
+    fn missing_bundle_requires_wordlist_path() {
+        let err = load(None).unwrap_err().to_string();
+        assert!(err.contains("pass --wordlist"), "{err}");
     }
 }

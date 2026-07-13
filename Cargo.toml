@@ -3,6 +3,12 @@ name = "wordlebits"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+default = ["bundled-wordlist"]
+# Embed words/valid-guesses.txt in the binary as the default wordlist.
+# Build with --no-default-features to exclude it; --wordlist is then required.
+bundled-wordlist = []
+
 [dependencies]
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }

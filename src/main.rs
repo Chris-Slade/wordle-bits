@@ -2,12 +2,20 @@ mod feedback;
 mod solver;
 mod wordlist;
 
+use std::io::{BufRead, IsTerminal, Write};
 use std::path::PathBuf;
 
 use anyhow::{Context, Result, bail, ensure};
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 
 use solver::Guess;
+
+#[derive(Clone, Copy, PartialEq, ValueEnum)]
+enum ColorMode {
+    Always,
+    Auto,
+    Never,
+}
 
 /// Suggest next Wordle guesses ranked by expected information (bits).
 #[derive(Parser)]
@@ -33,6 +41,14 @@ struct Cli {
     /// Only suggest words that are still possible answers
     #[arg(long)]
     candidates_only: bool,
+
+    /// Read further guesses from stdin, showing the game state each round
+    #[arg(short = 'i', long)]
+    interactive: bool,
+
+    /// When to use ANSI colors to display guesses
+    #[arg(long, value_enum, default_value_t = ColorMode::Auto)]
+    color: ColorMode,
 }
 
 /// Pair up guess tokens from the command line. Each positional argument may be
@@ -86,18 +102,51 @@ fn main() -> Result<()> {
         None => None,
     };
     let answer_pool: &[Vec<u8>] = answers.as_deref().unwrap_or(&words);
+    let color = match cli.color {
+        ColorMode::Always => true,
+        ColorMode::Never => false,
+        ColorMode::Auto => std::io::stdout().is_terminal(),
+    };
 
-    let guesses = parse_guesses(&cli.guesses, word_len)?;
+    let mut guesses = parse_guesses(&cli.guesses, word_len)?;
+    warn_unknown_words(&words, &guesses);
 
-    if let Some(solved) = guesses
-        .iter()
-        .find(|g| g.pattern.iter().all(|&c| c == feedback::GREEN))
-    {
-        println!("Solved: {}", String::from_utf8_lossy(&solved.word));
+    if !cli.interactive {
+        report(&words, answer_pool, &guesses, &cli, word_len)?;
         return Ok(());
     }
 
-    for g in &guesses {
+    println!("Enter guesses as WORD PATTERN (G=green, Y=yellow, X=gray); Ctrl-D to quit.");
+    let stdin = std::io::stdin();
+    loop {
+        show_state(&guesses, color);
+        if report(&words, answer_pool, &guesses, &cli, word_len)? {
+            return Ok(());
+        }
+
+        print!("\n> ");
+        std::io::stdout().flush()?;
+        let mut line = String::new();
+        if stdin.lock().read_line(&mut line)? == 0 {
+            println!();
+            return Ok(());
+        }
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        match parse_guesses(&[line.to_string()], word_len) {
+            Ok(new_guesses) => {
+                warn_unknown_words(&words, &new_guesses);
+                guesses.extend(new_guesses);
+            }
+            Err(e) => eprintln!("Error: {e:#}"),
+        }
+    }
+}
+
+fn warn_unknown_words(words: &[Vec<u8>], guesses: &[Guess]) {
+    for g in guesses {
         if words
             .binary_search_by(|w| w.as_slice().cmp(&g.word))
             .is_err()
@@ -108,8 +157,70 @@ fn main() -> Result<()> {
             );
         }
     }
+}
 
-    let candidates = solver::filter_candidates(answer_pool, &guesses);
+fn show_state(guesses: &[Guess], color: bool) {
+    if guesses.is_empty() {
+        return;
+    }
+    println!();
+    println!("Game so far:");
+    for g in guesses {
+        println!("  {}", format_guess(g, color));
+    }
+}
+
+fn pattern_to_string(pattern: &[u8]) -> String {
+    pattern
+        .iter()
+        .map(|&c| match c {
+            feedback::GREEN => 'G',
+            feedback::YELLOW => 'Y',
+            _ => 'X',
+        })
+        .collect()
+}
+
+fn format_guess(g: &Guess, color: bool) -> String {
+    let word = String::from_utf8_lossy(&g.word).to_uppercase();
+    if !color {
+        return format!("{} {}", word, pattern_to_string(&g.pattern));
+    }
+    let mut out = String::new();
+    for (ch, &cell) in word.chars().zip(&g.pattern) {
+        match cell {
+            feedback::GREEN => out.push_str("\x1b[32m"),
+            feedback::YELLOW => out.push_str("\x1b[33m"),
+            _ => {
+                out.push(ch);
+                continue;
+            }
+        }
+        out.push(ch);
+        out.push_str("\x1b[0m");
+    }
+    out
+}
+
+/// Print the report for the current guesses: solved/contradiction/single-
+/// candidate outcomes, or the candidate count and suggestion sections.
+/// Returns true when the game is over.
+fn report(
+    words: &[Vec<u8>],
+    answer_pool: &[Vec<u8>],
+    guesses: &[Guess],
+    cli: &Cli,
+    word_len: usize,
+) -> Result<bool> {
+    if let Some(solved) = guesses
+        .iter()
+        .find(|g| g.pattern.iter().all(|&c| c == feedback::GREEN))
+    {
+        println!("Solved: {}", String::from_utf8_lossy(&solved.word));
+        return Ok(true);
+    }
+
+    let candidates = solver::filter_candidates(answer_pool, guesses);
     match candidates.len() {
         0 => bail!(
             "No candidates match these guesses. Check the patterns for typos or a wordlist mismatch."
@@ -119,7 +230,7 @@ fn main() -> Result<()> {
                 "Only one candidate remains: {}",
                 String::from_utf8_lossy(candidates[0])
             );
-            return Ok(());
+            return Ok(true);
         }
         _ => {}
     }
@@ -165,7 +276,7 @@ fn main() -> Result<()> {
         println!();
         println!("* = still a possible answer");
     }
-    Ok(())
+    Ok(false)
 }
 
 fn print_section(title: &str, suggestions: &[&solver::Suggestion]) {
@@ -252,5 +363,31 @@ mod tests {
     fn parse_guess_rejects_non_alphabetic_word() {
         let err = parse_guess("gr33n", "GXYYX", 5).unwrap_err().to_string();
         assert!(err.contains("non-alphabetic"), "{err}");
+    }
+
+    #[test]
+    fn format_guess_plain_matches_input_format() {
+        let g = parse_guess("stint", "GGXXG", 5).unwrap();
+        assert_eq!(format_guess(&g, false), "STINT GGXXG");
+    }
+
+    #[test]
+    fn format_guess_colored_wraps_green_and_yellow_letters() {
+        let g = parse_guess("taros", "YXXYY", 5).unwrap();
+        assert_eq!(
+            format_guess(&g, true),
+            "\x1b[33mT\x1b[0mAR\x1b[33mO\x1b[0m\x1b[33mS\x1b[0m"
+        );
+        let g = parse_guess("stint", "GGXXG", 5).unwrap();
+        assert_eq!(
+            format_guess(&g, true),
+            "\x1b[32mS\x1b[0m\x1b[32mT\x1b[0mIN\x1b[32mT\x1b[0m"
+        );
+    }
+
+    #[test]
+    fn pattern_round_trips_through_string_form() {
+        let pattern = feedback::parse_pattern("GXYYX", 5).unwrap();
+        assert_eq!(pattern_to_string(&pattern), "GXYYX");
     }
 }
