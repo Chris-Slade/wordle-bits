@@ -21,6 +21,11 @@ struct Cli {
     #[arg(long, value_name = "PATH")]
     wordlist: Option<PathBuf>,
 
+    /// Optional answer list: candidates are drawn from it instead of the
+    /// primary wordlist, while suggestions still come from the primary list
+    #[arg(long, value_name = "PATH")]
+    answers: Option<PathBuf>,
+
     /// Number of suggestions to print
     #[arg(short = 'n', long = "top", default_value_t = 10, value_name = "N")]
     top: usize,
@@ -69,6 +74,18 @@ fn parse_guess(word: &str, pattern: &str, word_len: usize) -> Result<Guess> {
 fn main() -> Result<()> {
     let cli = Cli::parse();
     let (words, word_len) = wordlist::load(cli.wordlist.as_deref())?;
+    let answers = match &cli.answers {
+        Some(path) => {
+            let (answers, answers_len) = wordlist::load(Some(path))?;
+            ensure!(
+                answers_len == word_len,
+                "answer list word length ({answers_len}) does not match wordlist word length ({word_len})"
+            );
+            Some(answers)
+        }
+        None => None,
+    };
+    let answer_pool: &[Vec<u8>] = answers.as_deref().unwrap_or(&words);
 
     let guesses = parse_guesses(&cli.guesses, word_len)?;
 
@@ -92,7 +109,7 @@ fn main() -> Result<()> {
         }
     }
 
-    let candidates = solver::filter_candidates(&words, &guesses);
+    let candidates = solver::filter_candidates(answer_pool, &guesses);
     match candidates.len() {
         0 => bail!(
             "No candidates match these guesses. Check the patterns for typos or a wordlist mismatch."
@@ -110,7 +127,7 @@ fn main() -> Result<()> {
     println!(
         "Candidates remaining: {} of {}",
         candidates.len(),
-        words.len()
+        answer_pool.len()
     );
 
     let full_pool: Vec<&[u8]>;
