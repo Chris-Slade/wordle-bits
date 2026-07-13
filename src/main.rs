@@ -42,6 +42,11 @@ struct Cli {
     #[arg(long)]
     candidates_only: bool,
 
+    /// Evaluate how a specific guess ranks against the suggestion pool
+    /// (may be given multiple times)
+    #[arg(short = 'q', long, value_name = "WORD")]
+    query: Vec<String>,
+
     /// Read further guesses from stdin, showing the game state each round
     #[arg(short = 'i', long)]
     interactive: bool,
@@ -71,7 +76,7 @@ fn parse_guesses(args: &[String], word_len: usize) -> Result<Vec<Guess>> {
         .collect()
 }
 
-fn parse_guess(word: &str, pattern: &str, word_len: usize) -> Result<Guess> {
+fn parse_word(word: &str, word_len: usize) -> Result<Vec<u8>> {
     ensure!(
         word.chars().all(|c| c.is_ascii_alphabetic()),
         "word \"{word}\" contains non-alphabetic characters"
@@ -81,8 +86,12 @@ fn parse_guess(word: &str, pattern: &str, word_len: usize) -> Result<Guess> {
         "word \"{word}\" has length {}, expected {word_len}",
         word.len()
     );
+    Ok(word.to_ascii_lowercase().into_bytes())
+}
+
+fn parse_guess(word: &str, pattern: &str, word_len: usize) -> Result<Guess> {
     Ok(Guess {
-        word: word.to_ascii_lowercase().into_bytes(),
+        word: parse_word(word, word_len)?,
         pattern: feedback::parse_pattern(pattern, word_len)?,
     })
 }
@@ -109,10 +118,16 @@ fn main() -> Result<()> {
     };
 
     let mut guesses = parse_guesses(&cli.guesses, word_len)?;
-    warn_unknown_words(&words, &guesses);
+    warn_unknown_words(&words, guesses.iter().map(|g| g.word.as_slice()));
+    let queries: Vec<Vec<u8>> = cli
+        .query
+        .iter()
+        .map(|w| parse_word(w, word_len).with_context(|| format!("query \"{w}\" is invalid")))
+        .collect::<Result<_>>()?;
+    warn_unknown_words(&words, queries.iter().map(Vec::as_slice));
 
     if !cli.interactive {
-        report(&words, answer_pool, &guesses, &cli, word_len)?;
+        report(&words, answer_pool, &guesses, &queries, &cli, word_len)?;
         return Ok(());
     }
 
@@ -120,7 +135,7 @@ fn main() -> Result<()> {
     let stdin = std::io::stdin();
     loop {
         show_state(&guesses, color);
-        if report(&words, answer_pool, &guesses, &cli, word_len)? {
+        if report(&words, answer_pool, &guesses, &queries, &cli, word_len)? {
             return Ok(());
         }
 
@@ -137,7 +152,7 @@ fn main() -> Result<()> {
         }
         match parse_guesses(&[line.to_string()], word_len) {
             Ok(new_guesses) => {
-                warn_unknown_words(&words, &new_guesses);
+                warn_unknown_words(&words, new_guesses.iter().map(|g| g.word.as_slice()));
                 guesses.extend(new_guesses);
             }
             Err(e) => eprintln!("Error: {e:#}"),
@@ -145,15 +160,12 @@ fn main() -> Result<()> {
     }
 }
 
-fn warn_unknown_words(words: &[Vec<u8>], guesses: &[Guess]) {
-    for g in guesses {
-        if words
-            .binary_search_by(|w| w.as_slice().cmp(&g.word))
-            .is_err()
-        {
+fn warn_unknown_words<'a>(words: &[Vec<u8>], to_check: impl IntoIterator<Item = &'a [u8]>) {
+    for word in to_check {
+        if words.binary_search_by(|w| w.as_slice().cmp(word)).is_err() {
             eprintln!(
-                "Warning: guessed word \"{}\" is not in the wordlist",
-                String::from_utf8_lossy(&g.word)
+                "Warning: word \"{}\" is not in the wordlist",
+                String::from_utf8_lossy(word)
             );
         }
     }
@@ -209,6 +221,7 @@ fn report(
     words: &[Vec<u8>],
     answer_pool: &[Vec<u8>],
     guesses: &[Guess],
+    queries: &[Vec<u8>],
     cli: &Cli,
     word_len: usize,
 ) -> Result<bool> {
@@ -251,35 +264,99 @@ fn report(
 
     let scored = solver::score_guesses(pool, &candidates, word_len);
 
-    if cli.candidates_only {
-        print_section(
-            "Top candidates by expected information",
-            &solver::top_by_information(&scored, cli.top),
+    for query in queries {
+        let s = solver::score_guesses(&[query.as_slice()], &candidates, word_len)
+            .pop()
+            .expect("scoring one query yields one suggestion");
+        let (bits_rank, bits_ties) = rank_among(&scored, &s, |t| t.bits);
+        let (win_rank, win_ties) = rank_among(&scored, &s, |t| t.win_prob);
+        println!();
+        println!("Query {}:", s.word.to_uppercase());
+        println!(
+            "  {:>5.2} bits   rank {bits_rank} of {} by information{}",
+            s.bits,
+            scored.len(),
+            tie_clause(bits_ties)
         );
-        print_section(
-            "Top candidates by win probability (this guess or the next)",
-            &solver::top_by_win_probability(&scored, cli.top),
+        println!(
+            "  {:>5.1}% win   rank {win_rank} of {} by win probability{}",
+            100.0 * s.win_prob,
+            scored.len(),
+            tie_clause(win_ties)
         );
+        println!(
+            "  {}",
+            if s.is_candidate {
+                "still a possible answer"
+            } else {
+                "not a possible answer"
+            }
+        );
+    }
+
+    let subject = if cli.candidates_only {
+        "candidates"
     } else {
-        print_section(
-            "Top guesses by expected information",
-            &solver::top_by_information(&scored, cli.top),
-        );
+        "guesses"
+    };
+    let by_info = solver::top_by_information(&scored, cli.top);
+    let by_win = solver::top_by_win_probability(&scored, cli.top);
+
+    print_section(&format!("Top {subject} by expected information"), &by_info);
+    if !cli.candidates_only {
         print_section(
             "Top candidates by expected information",
             &solver::top_by_information(scored.iter().filter(|s| s.is_candidate), cli.top),
         );
-        print_section(
-            "Top guesses by win probability (this guess or the next)",
-            &solver::top_by_win_probability(&scored, cli.top),
-        );
+    }
+    let win_title = format!("Top {subject} by win probability (this guess or the next)");
+    if same_words(&by_info, &by_win) {
+        if !by_win.is_empty() {
+            println!();
+            println!("{win_title}: same as by expected information");
+        }
+    } else {
+        print_section(&win_title, &by_win);
+    }
+    if !cli.candidates_only && cli.top > 0 {
         println!();
         println!("* = still a possible answer");
     }
     Ok(false)
 }
 
+fn same_words(a: &[&solver::Suggestion], b: &[&solver::Suggestion]) -> bool {
+    a.len() == b.len() && a.iter().zip(b).all(|(x, y)| x.word == y.word)
+}
+
+/// Competition rank of `query` within `scored` under `key` (1 = best; tied
+/// words share a rank), plus how many other words have exactly the same score.
+fn rank_among(
+    scored: &[solver::Suggestion],
+    query: &solver::Suggestion,
+    key: impl Fn(&solver::Suggestion) -> f64,
+) -> (usize, usize) {
+    let value = key(query);
+    let ahead = scored.iter().filter(|s| key(s) > value).count();
+    let tied = scored
+        .iter()
+        .filter(|s| key(s) == value && s.word != query.word)
+        .count();
+    (ahead + 1, tied)
+}
+
+fn tie_clause(tied: usize) -> String {
+    match tied {
+        0 => String::new(),
+        1 => " (tied with 1 other)".to_string(),
+        n => format!(" (tied with {n} others)"),
+    }
+}
+
 fn print_section(title: &str, suggestions: &[&solver::Suggestion]) {
+    if suggestions.is_empty() {
+        return;
+    }
     println!();
     println!("{title}:");
     let width = suggestions.iter().map(|s| s.word.len()).max().unwrap_or(0);
@@ -389,5 +466,61 @@ mod tests {
     fn pattern_round_trips_through_string_form() {
         let pattern = feedback::parse_pattern("GXYYX", 5).unwrap();
         assert_eq!(pattern_to_string(&pattern), "GXYYX");
+    }
+
+    fn suggestion(word: &str, bits: f64) -> solver::Suggestion {
+        solver::Suggestion {
+            word: word.to_string(),
+            bits,
+            win_prob: 0.0,
+            is_candidate: false,
+        }
+    }
+
+    #[test]
+    fn rank_among_uses_competition_ranking() {
+        let scored = vec![
+            suggestion("aaaaa", 3.0),
+            suggestion("bbbbb", 2.0),
+            suggestion("ccccc", 2.0),
+            suggestion("ddddd", 1.0),
+        ];
+        // A query tied with the leaders ranks 1st.
+        assert_eq!(
+            rank_among(&scored, &suggestion("query", 3.0), |s| s.bits),
+            (1, 1)
+        );
+        // Tied with bbbbb/ccccc: one word ahead, two tied.
+        assert_eq!(
+            rank_among(&scored, &suggestion("query", 2.0), |s| s.bits),
+            (2, 2)
+        );
+        // A query already in the pool does not count itself as a tie.
+        assert_eq!(
+            rank_among(&scored, &suggestion("ddddd", 1.0), |s| s.bits),
+            (4, 0)
+        );
+        // Worse than everything.
+        assert_eq!(
+            rank_among(&scored, &suggestion("query", 0.5), |s| s.bits),
+            (5, 0)
+        );
+    }
+
+    #[test]
+    fn same_words_compares_words_in_order() {
+        let a = suggestion("aaaaa", 3.0);
+        let b = suggestion("bbbbb", 2.0);
+        assert!(same_words(&[&a, &b], &[&a, &b]));
+        assert!(!same_words(&[&a, &b], &[&b, &a]));
+        assert!(!same_words(&[&a, &b], &[&a]));
+        assert!(same_words(&[], &[]));
+    }
+
+    #[test]
+    fn tie_clause_wording() {
+        assert_eq!(tie_clause(0), "");
+        assert_eq!(tie_clause(1), " (tied with 1 other)");
+        assert_eq!(tie_clause(3), " (tied with 3 others)");
     }
 }
